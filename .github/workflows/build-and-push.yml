@@ -116,6 +116,9 @@ jobs:
           cache-to: type=gha,scope=openmaic,mode=max
 
       - name: Summary
+        # Runs on failure too: knowing which upstream ref or commit was being
+        # built is most useful exactly when the build did not finish.
+        if: always()
         run: |
           {
             echo "### OpenMAIC image"

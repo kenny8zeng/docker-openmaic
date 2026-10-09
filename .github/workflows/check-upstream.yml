@@ -125,6 +125,9 @@ jobs:
             --body-file /tmp/pr-body.md
 
       - name: Summary
+        # Runs on failure too: knowing which side of the comparison produced an
+        # outcome is most useful exactly when the run did not end cleanly.
+        if: always()
         run: |
           {
             echo "### Upstream release check"
