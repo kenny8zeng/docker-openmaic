@@ -1,0 +1,137 @@
+name: Check Upstream Release
+
+# Watches THU-MAIC/OpenMAIC for a newer stable release and proposes OPENMAIC_REF
+# bumps as a pull request. Merging that PR is what actually publishes an image
+# (see build-and-push.yml); this workflow never pushes an image itself.
+#
+# Only stable releases are considered. A pinned prerelease (v1.2.0-rc.1) is left
+# alone until the matching stable release exists — see the version comparison
+# below, which refuses to move backwards.
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: openmaic-check-upstream
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Find the newest stable upstream release
+        id: upstream
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # The releases endpoint filters out monorepo package tags such as
+          # `@openmaic/storage@0.37.3`, which a plain tag listing would return.
+          tag="$(gh api 'repos/THU-MAIC/OpenMAIC/releases?per_page=100' \
+            --jq '[.[] | select(.draft == false and .prerelease == false)] | .[0].tag_name')"
+          if [ -z "$tag" ] || [ "$tag" = "null" ]; then
+            echo "error: no stable release found for THU-MAIC/OpenMAIC" >&2
+            exit 1
+          fi
+          echo "latest stable release: $tag"
+          echo "tag=$tag" >>"$GITHUB_OUTPUT"
+
+      - name: Decide whether an update is needed
+        id: decide
+        env:
+          LATEST: ${{ steps.upstream.outputs.tag }}
+        run: |
+          set -euo pipefail
+          current="$(tr -d '[:space:]' <OPENMAIC_REF)"
+          echo "pinned ref : $current"
+          echo "latest     : $LATEST"
+
+          # Numeric version only, without the leading `v` or a prerelease /
+          # build suffix. `sort -V` understands neither and would rank
+          # v1.2.0-rc.1 above the v1.2.0 it actually precedes.
+          base_version() {
+            printf '%s' "$1" | sed -E 's/^v//; s/[-+].*$//'
+          }
+
+          update=false
+          if [ "$current" = "$LATEST" ]; then
+            echo "already tracking the latest stable release"
+          elif ! printf '%s' "$current" | grep -Eq '^v?[0-9]+(\.[0-9]+)+([-+].*)?$'; then
+            # A branch or a commit sha cannot be compared with a release tag;
+            # bumping it automatically would replace an intentional pin.
+            echo "OPENMAIC_REF is not a release tag; leaving it alone"
+          elif [ "$(base_version "$current")" = "$(base_version "$LATEST")" ]; then
+            # Same version: the prerelease suffix is dropped once the final
+            # release of that version lands (v1.2.0-rc.1 -> v1.2.0).
+            case "$current" in
+              *-*) update=true ;;
+            esac
+            echo "pinned and latest are the same version; prerelease superseded: $update"
+          elif printf '%s\n%s\n' "$(base_version "$current")" "$(base_version "$LATEST")" | sort -V -C; then
+            # `sort -V -C` succeeds only when the pinned ref sorts below the
+            # release, which is what keeps a pinned prerelease from being
+            # dragged back to an older stable release (v1.2.0-rc.1 > v1.1.3).
+            echo "update available: $current -> $LATEST"
+            update=true
+          else
+            echo "pinned ref is not older than the latest stable release; nothing to do"
+          fi
+          echo "update=$update" >>"$GITHUB_OUTPUT"
+
+      - name: Open a pull request that bumps OPENMAIC_REF
+        if: steps.decide.outputs.update == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LATEST: ${{ steps.upstream.outputs.tag }}
+        run: |
+          set -euo pipefail
+          branch="chore/bump-openmaic-$LATEST"
+
+          # Idempotent: a rerun (or a manually opened PR for the same release)
+          # must not stack a second branch or a second pull request.
+          existing="$(gh pr list --head "$branch" --state all --json number --jq 'length')"
+          if [ "${existing:-0}" != "0" ]; then
+            echo "a pull request from $branch already exists; skipping"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
+          printf '%s\n' "$LATEST" >OPENMAIC_REF
+          git commit --quiet -am "chore: bump OpenMAIC to $LATEST"
+          git push --quiet origin "$branch"
+
+          cat >/tmp/pr-body.md <<EOF
+          Upstream [\`$LATEST\`](https://github.com/THU-MAIC/OpenMAIC/releases/tag/$LATEST) is the newest stable release. This updates \`OPENMAIC_REF\`; merging it triggers the image build and publishes the \`$LATEST\` and \`latest\` tags.
+
+          Before merging, check whether anything in \`overlay/\` has been superseded upstream.
+
+          _Opened automatically by \`.github/workflows/check-upstream.yml\`._
+          EOF
+
+          gh pr create \
+            --base "${{ github.event.repository.default_branch }}" \
+            --head "$branch" \
+            --title "chore: bump OpenMAIC to $LATEST" \
+            --body-file /tmp/pr-body.md
+
+      - name: Summary
+        run: |
+          {
+            echo "### Upstream release check"
+            echo
+            echo "| | |"
+            echo "| --- | --- |"
+            echo "| pinned (\`OPENMAIC_REF\`) | \`$(tr -d '[:space:]' <OPENMAIC_REF)\` |"
+            echo "| latest stable | \`${{ steps.upstream.outputs.tag }}\` |"
+            echo "| action | ${{ steps.decide.outputs.update == 'true' && 'pull request opened' || 'none' }} |"
+          } >>"$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,134 @@
+name: Build & Push OpenMAIC Image
+
+# Publishing is driven by OPENMAIC_REF: changing that file on the default branch
+# ships the image for that upstream ref. `workflow_dispatch` exists to build an
+# arbitrary upstream ref (a release candidate, a branch, a commit) on demand.
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - "**/*.md"
+      - ".github/workflows/check-upstream.yml"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Upstream OpenMAIC ref (tag, branch or commit sha). Empty = OPENMAIC_REF."
+        required: false
+        default: ""
+      platforms:
+        description: "Target platforms"
+        required: false
+        default: "linux/amd64,linux/arm64"
+      push:
+        description: "Push the image to the registries"
+        type: boolean
+        default: true
+      no_cache:
+        description: "Ignore the build cache and rebuild every layer"
+        type: boolean
+        default: false
+
+# Serialized on purpose: two concurrent builds of the same ref race on the GHCR
+# manifest and spend runner time on identical layers.
+concurrency:
+  group: openmaic-image-publish
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  docker:
+    runs-on: ubuntu-latest
+    env:
+      # `inputs` is empty for push events, so derive the effective values from
+      # the event rather than from an input default that is not set here.
+      PUSH: ${{ github.event_name == 'push' || inputs.push }}
+      PLATFORMS: ${{ inputs.platforms || 'linux/amd64,linux/arm64' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Resolve upstream source
+        id: upstream
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPSTREAM_REPO: https://github.com/THU-MAIC/OpenMAIC.git
+        run: ./scripts/prepare-context.sh "${{ inputs.ref }}"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to Docker Hub
+        if: env.PUSH == 'true'
+        uses: docker/login-action@v4
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME || secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Login to GHCR
+        if: env.PUSH == 'true'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: |
+            ghcr.io/${{ github.repository_owner }}/openmaic
+            ${{ vars.DOCKERHUB_USERNAME || secrets.DOCKERHUB_USERNAME }}/openmaic
+          # `latest` and the branch tag are floating tags for the pinned ref:
+          # builds of an explicitly overridden ref must not move them.
+          tags: |
+            type=raw,value=${{ steps.upstream.outputs.tag }}
+            type=raw,value=sha-${{ steps.upstream.outputs.short_sha }}
+            type=raw,value=latest,enable=${{ inputs.ref == '' }}
+            type=ref,event=branch,enable=${{ inputs.ref == '' }}
+          labels: |
+            org.opencontainers.image.title=OpenMAIC
+            org.opencontainers.image.description=Unofficial container image of OpenMAIC (agent-built interactive classrooms)
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.upstream.outputs.version }}
+            org.opencontainers.image.revision=${{ steps.upstream.outputs.sha }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          # Upstream ships the Dockerfile: the workspace only supplies the
+          # source tree it expects, so the context is the checkout itself.
+          context: ./src
+          file: ./src/Dockerfile
+          platforms: ${{ env.PLATFORMS }}
+          push: ${{ env.PUSH }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          no-cache: ${{ inputs.no_cache || false }}
+          cache-from: type=gha,scope=openmaic
+          cache-to: type=gha,scope=openmaic,mode=max
+
+      - name: Summary
+        run: |
+          {
+            echo "### OpenMAIC image"
+            echo
+            echo "| | |"
+            echo "| --- | --- |"
+            echo "| upstream ref | \`${{ steps.upstream.outputs.ref }}\` |"
+            echo "| upstream commit | \`${{ steps.upstream.outputs.sha }}\` |"
+            echo "| app version | \`${{ steps.upstream.outputs.version }}\` |"
+            echo "| platforms | \`${{ env.PLATFORMS }}\` |"
+            echo "| pushed | \`${{ env.PUSH }}\` |"
+            echo
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}"
+            echo '```'
+          } >>"$GITHUB_STEP_SUMMARY"

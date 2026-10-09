@@ -1,0 +1,6 @@
+# Upstream checkout produced by scripts/prepare-context.sh
+/src/
+
+# Local .env files (never committed; the image is configured at run time)
+.env
+.env.local
